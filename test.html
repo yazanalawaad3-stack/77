@@ -1,163 +1,103 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Deposit Test</title>
-  <style>
-    body { font-family: system-ui, Arial; max-width: 900px; margin: 24px auto; padding: 0 12px; }
-    .card { border: 1px solid #ddd; border-radius: 14px; padding: 16px; margin: 12px 0; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; }
-    .row > * { flex: 1; min-width: 220px; }
-    label { display:block; font-size: 12px; opacity:.75; margin-bottom:6px; }
-    input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 12px; }
-    button { padding: 10px 14px; border: 1px solid #111; border-radius: 12px; background: #111; color: #fff; cursor: pointer; }
-    button:disabled { opacity: .5; cursor:not-allowed; }
-    pre { background: #0b0b0b; color: #d7ffd7; padding: 12px; border-radius: 12px; overflow:auto; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
-    .ok { color:#0a7a0a; font-weight:700; }
-    .bad { color:#b00020; font-weight:700; }
-  </style>
-</head>
-<body>
-  <h2>Supabase Auth + Deposit Address (Test Page)</h2>
+import { createClient } from "npm:@supabase/supabase-js@2";
+import { ethers } from "npm:ethers@6";
 
-  <div class="card">
-    <div class="row">
-      <div>
-        <label>SUPABASE_URL</label>
-        <input id="url" class="mono" value="https://unxdhdwatwvfokrsdpqg.supabase.co" />
-      </div>
-      <div>
-        <label>SUPABASE_ANON_KEY</label>
-        <input id="anon" class="mono" value="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueGRoZHdhdHd2Zm9rcnNkcHFnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjYwOTU1NDcsImV4cCI6MjA4MTY3MTU0N30.SzmdJGRBF4vhigSpz5v8YcrA4DvUYQ8y9GYhMeNeQYU" />
-      </div>
-    </div>
+function mustEnv(name: string): string {
+  const v = Deno.env.get(name);
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
+}
 
-    <div class="row">
-      <div>
-        <label>Email</label>
-        <input id="email" placeholder="test@test.com" />
-      </div>
-      <div>
-        <label>Password</label>
-        <input id="pass" type="password" placeholder="********" />
-      </div>
-    </div>
+Deno.serve(async (req) => {
+  try {
+    const supabaseAdmin = createClient(
+      mustEnv("SUPABASE_URL"),
+      mustEnv("SUPABASE_SERVICE_ROLE_KEY")
+    );
 
-    <div class="row">
-      <button id="btnSignup">Sign up</button>
-      <button id="btnLogin">Login</button>
-      <button id="btnLogout" disabled>Logout</button>
-    </div>
+    // Get user from the caller JWT
+    const authHeader = req.headers.get("authorization") || "";
+    const jwt = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!jwt) return new Response(JSON.stringify({ error: "missing_jwt" }), { status: 401 });
 
-    <p id="status" class="mono"></p>
-    <pre id="out" class="mono"></pre>
-  </div>
+    const { data: u, error: uErr } = await supabaseAdmin.auth.getUser(jwt);
+    if (uErr || !u?.user?.id) {
+      return new Response(JSON.stringify({ error: "invalid_user" }), { status: 401 });
+    }
+    const userId = u.user.id;
 
-  <div class="card">
-    <h3>Deposit Address</h3>
-    <div class="row">
-      <button id="btnGetAddr" disabled>Get deposit address</button>
-    </div>
-    <pre id="addr" class="mono"></pre>
-  </div>
+    // If address already exists, return it
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from("deposit_addresses")
+      .select("address, derivation_path")
+      .eq("user_id", userId)
+      .eq("chain", "BSC")
+      .eq("status", "active")
+      .maybeSingle();
 
-  <script type="module">
-    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+    if (exErr) throw exErr;
+    if (existing?.address) {
+      return new Response(JSON.stringify({ address: existing.address, derivation_path: existing.derivation_path }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
 
-    const $ = (id) => document.getElementById(id);
-    const statusEl = $("status");
-    const outEl = $("out");
-    const addrEl = $("addr");
+    // Allocate stable derivation index for this user
+    const { data: idxRow, error: idxErr } = await supabaseAdmin
+      .from("user_deposit_index")
+      .select("derivation_index")
+      .eq("user_id", userId)
+      .eq("chain", "BSC")
+      .maybeSingle();
 
-    let supabase = null;
+    if (idxErr) throw idxErr;
 
-    const setStatus = (ok, msg) => {
-      statusEl.className = (ok ? "mono ok" : "mono bad");
-      statusEl.textContent = msg;
-    };
+    let derivationIndex: number;
 
-    const log = (obj) => {
-      outEl.textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
-    };
+    if (idxRow?.derivation_index !== undefined && idxRow?.derivation_index !== null) {
+      derivationIndex = Number(idxRow.derivation_index);
+    } else {
+      // get next index from sequence
+      const { data: seq, error: seqErr } = await supabaseAdmin.rpc("next_deposit_derivation_index");
+      if (seqErr) throw seqErr;
 
-    const build = () => {
-      const url = $("url").value.trim();
-      const anon = $("anon").value.trim();
-      if (!url || !anon) throw new Error("Missing URL or anon key");
-      supabase = createClient(url, anon);
-      return supabase;
-    };
+      derivationIndex = Number(seq);
 
-    const enableAfterLogin = (on) => {
-      $("btnGetAddr").disabled = !on;
-      $("btnLogout").disabled = !on;
-    };
+      const { error: insIdxErr } = await supabaseAdmin
+        .from("user_deposit_index")
+        .insert([{ user_id: userId, chain: "BSC", derivation_index: derivationIndex }]);
+      if (insIdxErr) throw insIdxErr;
+    }
 
-    $("btnSignup").onclick = async () => {
-      try {
-        const sb = build();
-        const email = $("email").value.trim();
-        const password = $("pass").value;
-        if (!email || !password) return setStatus(false, "Missing email or password");
+    // Derive address from MASTER_MNEMONIC
+    const mnemonic = ethers.Mnemonic.fromPhrase(mustEnv("MASTER_MNEMONIC").trim());
+    const derivationPath = `m/44'/60'/0'/0/${derivationIndex}`;
+    const wallet = ethers.HDNodeWallet.fromMnemonic(mnemonic, derivationPath);
 
-        setStatus(true, "Signing up...");
-        const { data, error } = await sb.auth.signUp({ email, password });
-        if (error) return setStatus(false, "Signup error: " + error.message);
+    const address = wallet.address;
 
-        setStatus(true, "Signup OK (check email if confirmation is enabled)");
-        log({ signup: "ok", user_id: data.user?.id });
-      } catch (e) {
-        setStatus(false, String(e?.message || e));
-      }
-    };
+    // Save address
+    const { error: insAddrErr } = await supabaseAdmin
+      .from("deposit_addresses")
+      .insert([{
+        user_id: userId,
+        chain: "BSC",
+        address,
+        derivation_path: derivationPath,
+        status: "active",
+      }]);
 
-    $("btnLogin").onclick = async () => {
-      try {
-        const sb = build();
-        const email = $("email").value.trim();
-        const password = $("pass").value;
-        if (!email || !password) return setStatus(false, "Missing email or password");
+    if (insAddrErr) throw insAddrErr;
 
-        setStatus(true, "Logging in...");
-        const { data, error } = await sb.auth.signInWithPassword({ email, password });
-        if (error) return setStatus(false, "Login error: " + error.message);
+    return new Response(JSON.stringify({ address, derivation_path: derivationPath }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
 
-        setStatus(true, "Login OK");
-        enableAfterLogin(true);
-        log({ login: "ok", user_id: data.user.id });
-      } catch (e) {
-        setStatus(false, String(e?.message || e));
-      }
-    };
-
-    $("btnLogout").onclick = async () => {
-      try {
-        if (!supabase) build();
-        await supabase.auth.signOut();
-        enableAfterLogin(false);
-        addrEl.textContent = "";
-        setStatus(true, "Logged out");
-        log({ logout: "ok" });
-      } catch (e) {
-        setStatus(false, String(e?.message || e));
-      }
-    };
-
-    $("btnGetAddr").onclick = async () => {
-      try {
-        if (!supabase) build();
-        setStatus(true, "Calling get-deposit-address...");
-        const { data, error } = await supabase.functions.invoke("get-deposit-address");
-        if (error) return setStatus(false, "Function error: " + error.message);
-        if (!data?.address) return setStatus(false, "No address returned");
-        addrEl.textContent = data.address;
-        setStatus(true, "Address OK");
-      } catch (e) {
-        setStatus(false, String(e?.message || e));
-      }
-    };
-  </script>
-</body>
-</html>
+  } catch (e) {
+    return new Response(JSON.stringify({ error: "runtime_error", message: String((e as any)?.message || e) }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+});
