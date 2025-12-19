@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Phone Auth + Get Deposit Address (Supabase)</title>
+  <style>
+    body { font-family: system-ui, Arial; max-width: 980px; margin: 24px auto; padding: 0 12px; }
+    .card { border: 1px solid #ddd; border-radius: 14px; padding: 16px; margin: 12px 0; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+    .row > * { flex: 1; min-width: 240px; }
+    label { display:block; font-size: 12px; opacity:.75; margin-bottom:6px; }
+    input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 12px; }
+    button { padding: 10px 14px; border: 1px solid #111; border-radius: 12px; background: #111; color: #fff; cursor: pointer; }
+    button.secondary { background: #fff; color:#111; }
+    button:disabled { opacity: .5; cursor:not-allowed; }
+    pre { background: #0b0b0b; color: #d7ffd7; padding: 12px; border-radius: 12px; overflow:auto; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .ok { color:#0a7a0a; font-weight:700; }
+    .bad { color:#b00020; font-weight:700; }
+    .hint { opacity:.75; font-size: 13px; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <h2>Phone Auth + Get Deposit Address (Test Page)</h2>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>SUPABASE_URL</label>
+        <input id="url" class="mono" value="https://unxdhdwatwvfokrsdpqg.supabase.co" />
+      </div>
+      <div>
+        <label>SUPABASE_ANON_KEY (public)</label>
+        <input id="anon" class="mono" value="" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueGRoZHdhdHd2Zm9rcnNkcHFnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjYwOTU1NDcsImV4cCI6MjA4MTY3MTU0N30.SzmdJGRBF4vhigSpz5v8YcrA4DvUYQ8y9GYhMeNeQYU" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Phone (example: +96170123456)</label>
+        <input id="phone" placeholder="+96170123456" autocomplete="username" />
+      </div>
+      <div>
+        <label>Password</label>
+        <input id="pass" type="password" placeholder="********" autocomplete="current-password" />
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="btnSignup">Sign up</button>
+      <button id="btnLogin">Login</button>
+      <button id="btnLogout" class="secondary" disabled>Logout</button>
+      <button id="btnSession" class="secondary">Get session</button>
+    </div>
+
+    <p class="hint">
+      This page does NOT use email UI. It maps phone to an internal login like:
+      <span class="mono">+96170123456@phone.local</span>.
+      <br/>Do NOT put service_role or secret keys in this page.
+    </p>
+
+    <p id="status" class="mono"></p>
+    <pre id="out" class="mono"></pre>
+  </div>
+
+  <div class="card">
+    <h3>Deposit Address</h3>
+    <div class="row">
+      <button id="btnGetAddr" disabled>Get deposit address</button>
+      <button id="btnRunMonitor" class="secondary" disabled>Run monitor-bsc-usdt</button>
+    </div>
+    <pre id="addr" class="mono"></pre>
+  </div>
+
+  <script type="module">
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $("status");
+    const outEl = $("out");
+    const addrEl = $("addr");
+    let supabase = null;
+
+    const setStatus = (ok, msg) => {
+      statusEl.className = ok ? "mono ok" : "mono bad";
+      statusEl.textContent = msg;
+    };
+    const log = (obj) => {
+      outEl.textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+    };
+    const build = () => {
+      const url = $("url").value.trim();
+      const anon = $("anon").value.trim();
+      if (!url || !anon) throw new Error("Missing SUPABASE_URL or SUPABASE_ANON_KEY");
+      supabase = createClient(url, anon);
+      return supabase;
+    };
+
+    const normalizePhone = (p) => p.trim().replace(/\s+/g, "");
+    const phoneToEmail = (phone) => {
+      const safe = normalizePhone(phone).replace(/[^\d+]/g, "");
+      return `${safe}@phone.local`.toLowerCase();
+    };
+
+    const enableAfterLogin = (on) => {
+      $("btnGetAddr").disabled = !on;
+      $("btnRunMonitor").disabled = !on;
+      $("btnLogout").disabled = !on;
+    };
+
+    (async () => {
+      try {
+        const sb = build();
+        const { data } = await sb.auth.getSession();
+        const uid = data?.session?.user?.id;
+        if (uid) {
+          enableAfterLogin(true);
+          setStatus(true, "Session restored");
+          log({ session: "ok", user_id: uid });
+        } else {
+          enableAfterLogin(false);
+          setStatus(true, "No active session");
+        }
+      } catch (e) {
+        setStatus(false, String(e?.message || e));
+      }
+    })();
+
+    $("btnSignup").onclick = async () => {
+      try {
+        const sb = build();
+        const phone = $("phone").value;
+        const password = $("pass").value;
+        if (!phone || !password) return setStatus(false, "Missing phone or password");
+        const email = phoneToEmail(phone);
+
+        setStatus(true, "Signing up...");
+        const { data, error } = await sb.auth.signUp({ email, password });
+        if (error) return setStatus(false, "Signup error: " + error.message);
+
+        setStatus(true, "Signup OK");
+        log({ signup: "ok", user_id: data.user?.id ?? null, phone_input: normalizePhone(phone) });
+      } catch (e) {
+        setStatus(false, String(e?.message || e));
+      }
+    };
+
+    $("btnLogin").onclick = async () => {
+      try {
+        const sb = build();
+        const phone = $("phone").value;
+        const password = $("pass").value;
+        if (!phone || !password) return setStatus(false, "Missing phone or password");
+        const email = phoneToEmail(phone);
+
+        setStatus(true, "Logging in...");
+        const { data, error } = await sb.auth.signInWithPassword({ email, password });
+        if (error) return setStatus(false, "Login error: " + error.message);
+
+        setStatus(true, "Login OK");
+        enableAfterLogin(true);
+        log({ login: "ok", user_id: data.user.id, phone_input: normalizePhone(phone) });
+      } catch (e) {
+        setStatus(false, String(e?.message || e));
+      }
+    };
+
+    $("btnLogout").onclick = async () => {
+      try {
+        const sb = supabase || build();
+        await sb.auth.signOut();
+        enableAfterLogin(false);
+        addrEl.textContent = "";
+        setStatus(true, "Logged out");
+        log({ logout: "ok" });
+      } catch (e) {
+        setStatus(false, String(e?.message || e));
+      }
+    };
+
+    $("btnSession").onclick = async () => {
+      try {
+        const sb = supabase || build();
+        const { data, error } = await sb.auth.getSession();
+        if (error) return setStatus(false, "Session error: " + error.message);
+        const uid = data?.session?.user?.id;
+        setStatus(true, uid ? "Session OK" : "No active session");
+        log({ session: uid ? "ok" : "none", user_id: uid ?? null });
+        enableAfterLogin(Boolean(uid));
+      } catch (e) {
+        setStatus(false, String(e?.message || e));
+      }
+    };
+
+    $("btnGetAddr").onclick = async () => {
+      try {
+        const sb = supabase || build();
+        setStatus(true, "Calling get-deposit-address...");
+        const { data, error } = await sb.functions.invoke("get-deposit-address", { body: {} });
+        if (error) return setStatus(false, "Function error: " + error.message);
+        if (!data?.address) return setStatus(false, "No address returned");
+        addrEl.textContent = data.address;
+        setStatus(true, "Address OK");
+        log(data);
+      } catch (e) {
+        setStatus(false, String(e?.message || e));
+      }
+    };
+
+    $("btnRunMonitor").onclick = async () => {
+      try {
+        const sb = supabase || build();
+        setStatus(true, "Calling monitor-bsc-usdt...");
+        const { data, error } = await sb.functions.invoke("monitor-bsc-usdt", { body: {} });
+        if (error) return setStatus(false, "Function error: " + error.message);
+        setStatus(true, "Monitor OK");
+        log(data);
+      } catch (e) {
+        setStatus(false, String(e?.message || e));
+      }
+    };
+  </script>
+</body>
+</html>
